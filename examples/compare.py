@@ -1,3 +1,12 @@
+"""
+Runs train_mini_gpt.py in both --mode native and --mode fused as separate
+subprocesses (clean CUDA memory state each time), averages over multiple
+trials, and prints one clean side-by-side comparison table.
+
+Run:
+    python examples/compare.py --trials 3 --steps 100
+"""
+
 import argparse
 import re
 import subprocess
@@ -10,6 +19,7 @@ RESULT_RE = re.compile(
     r".*?final loss:\s*([\d.]+)",
     re.DOTALL,
 )
+
 
 def run_once(mode, args):
     cmd = [
@@ -43,6 +53,7 @@ def run_once(mode, args):
     peak_vram_gb = float(match.group(2))
     final_loss = float(match.group(3))
     return tokens_per_sec, peak_vram_gb, final_loss
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -96,6 +107,7 @@ def main():
     print("=" * 60)
     print(f"\nResult: fused is {speedup:.2f}x faster and uses {mem_reduction:.1f}% less peak VRAM,")
     print(f"averaged over {args.trials} trial(s) x {args.steps} steps each.")
+
 
 if __name__ == "__main__":
     main()

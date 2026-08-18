@@ -1,9 +1,4 @@
-"""
-Correctness tests for FusedMoEMLPSorted: forward output AND gradients must
-match a naive reference MoE MLP exactly (same weights, same routing
-decision), since the sort/gather/scatter restructuring is new and has
-real bug risk (index bookkeeping, permutation correctness).
-"""
+"""Correctness tests for the sorted-dispatch MoE layer vs a naive masked-loop reference."""
 
 import pytest
 import torch
@@ -15,14 +10,13 @@ pytestmark = pytest.mark.skipif(not CUDA, reason="requires CUDA GPU")
 
 
 class NaiveMoEMLP(nn.Module):
-    """Reference: masked loop + naive (non-fused) softmax/topk routing."""
     def __init__(self, dim, hidden_dim, n_experts, k, experts):
         super().__init__()
         self.dim = dim
         self.n_experts = n_experts
         self.k = k
         self.router = nn.Linear(dim, n_experts, bias=False)
-        self.experts = experts  # share weights with the layer under test
+        self.experts = experts
 
     def forward(self, x):
         orig_shape = x.shape
@@ -63,29 +57,24 @@ def test_sorted_dispatch_matches_naive(n_experts, k):
     out_sorted = sorted_layer(x_sorted)
     out_naive = naive_layer(x_naive)
 
-    assert torch.allclose(out_sorted, out_naive, atol=1e-3, rtol=1e-3), \
-        f"sorted-dispatch output mismatch at n_experts={n_experts}, k={k}"
+    assert torch.allclose(out_sorted, out_naive, atol=1e-3, rtol=1e-3)
 
     grad_out = torch.randn_like(out_sorted)
     out_sorted.backward(grad_out)
     out_naive.backward(grad_out)
 
-    assert torch.allclose(x_sorted.grad, x_naive.grad, atol=1e-3, rtol=1e-3), \
-        f"sorted-dispatch input gradient mismatch at n_experts={n_experts}, k={k}"
+    assert torch.allclose(x_sorted.grad, x_naive.grad, atol=1e-3, rtol=1e-3)
     assert torch.allclose(
         sorted_layer.router.weight.grad, naive_layer.router.weight.grad, atol=1e-3, rtol=1e-3
-    ), f"sorted-dispatch router gradient mismatch at n_experts={n_experts}, k={k}"
+    )
 
 
 def test_sorted_dispatch_handles_empty_experts():
-    """With very few tokens and many experts, some experts get zero tokens
-    routed to them — make sure the `if cnt == 0: continue` path is correct
-    and doesn't break gradients for unused experts."""
     from fusedkernels.moe_layer_sorted import FusedMoEMLPSorted
 
     torch.manual_seed(1)
     layer = FusedMoEMLPSorted(dim=64, hidden_dim=128, n_experts=64, k=2, router_version="v2").cuda()
-    x = torch.randn(1, 4, 64, device="cuda", requires_grad=True)  # only 4 tokens, 64 experts
+    x = torch.randn(1, 4, 64, device="cuda", requires_grad=True)
 
     out = layer(x)
     assert out.shape == x.shape

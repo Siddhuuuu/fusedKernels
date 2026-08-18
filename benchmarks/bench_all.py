@@ -1,12 +1,8 @@
 """
-Benchmark fused kernels vs native PyTorch: latency (fwd+bwd) and peak memory.
+Benchmark fused kernels vs native PyTorch: latency (fwd+bwd) and peak
+memory. Run on a CUDA GPU:
 
-Run on a CUDA GPU:
     python benchmarks/bench_all.py
-
-This is the script that produces your ROI numbers — run it on the GPU(s)
-you actually train on and report the deltas (tokens/sec, peak VRAM) in
-your README / writeup.
 """
 
 import time
@@ -16,7 +12,6 @@ import torch.nn.functional as F
 from fusedkernels.cross_entropy import fused_cross_entropy
 from fusedkernels.rmsnorm import FusedRMSNorm
 from fusedkernels.swiglu import fused_swiglu
-from fusedkernels.moe_routing import fused_moe_route
 
 
 def _bench(fn, *args, warmup=10, iters=50):
@@ -32,7 +27,7 @@ def _bench(fn, *args, warmup=10, iters=50):
     elapsed = (time.perf_counter() - start) / iters
 
     peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
-    return elapsed * 1000, peak_mem_mb  # ms, MB
+    return elapsed * 1000, peak_mem_mb
 
 
 def bench_cross_entropy(N=8192, V=128256):
@@ -121,36 +116,9 @@ def bench_swiglu(N=8192, D=14336):
     print(f"  speedup: {t_native / t_fused:.2f}x   mem reduction: {(1 - m_fused / m_native) * 100:.1f}%")
 
 
-def bench_moe_routing(N=32768, n_experts=8, k=2):
-    print(f"\n=== MoE Router (N={N} tokens, n_experts={n_experts}, k={k}) ===")
-
-    def naive_step(logits):
-        logits = logits.clone().requires_grad_(True)
-        probs = F.softmax(logits, dim=-1)
-        w, idx = torch.topk(probs, k, dim=-1)
-        w = w / w.sum(-1, keepdim=True)
-        w.sum().backward()
-
-    def fused_step(logits):
-        logits = logits.clone().requires_grad_(True)
-        w, idx = fused_moe_route(logits, k)
-        w.sum().backward()
-
-    logits = torch.randn(N, n_experts, device="cuda", dtype=torch.float32)
-
-    t_native, m_native = _bench(naive_step, logits)
-    t_fused, m_fused = _bench(fused_step, logits)
-
-    print(f"  native:  {t_native:7.3f} ms/iter   peak mem: {m_native:8.1f} MB")
-    print(f"  fused:   {t_fused:7.3f} ms/iter   peak mem: {m_fused:8.1f} MB")
-    print(f"  speedup: {t_native / t_fused:.2f}x   mem reduction: {(1 - m_fused / m_native) * 100:.1f}%")
-
-
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "This benchmark requires a CUDA GPU."
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     bench_cross_entropy()
     bench_rmsnorm()
     bench_swiglu()
-    bench_moe_routing()
-    bench_moe_routing(N=32768, n_experts=64, k=8)  # larger-expert-count regime

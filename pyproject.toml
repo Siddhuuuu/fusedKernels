@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fusedkernels"
-version = "0.1.0"
-description = "Fused Triton kernels (CrossEntropy, RMSNorm, SwiGLU) for reduced memory and faster LLM training"
+version = "0.2.0"
+description = "Fused Triton kernels (CrossEntropy, RMSNorm, SwiGLU, MoE routing) for faster, lower-memory LLM training"
 requires-python = ">=3.9"
 dependencies = [
     "torch>=2.1.0",
@@ -17,3 +17,6 @@ dev = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
 include = ["fusedkernels*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

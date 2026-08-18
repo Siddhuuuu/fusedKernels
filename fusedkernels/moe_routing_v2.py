@@ -1,60 +1,28 @@
 """
-EXPERIMENTAL: bitonic-sort-based fused MoE router.
+v2: fused MoE router using Triton's tl.sort (a bitonic sorting network
+under the hood) for top-k selection, plus a vectorized 2D-tile extraction
+step. This is the main, recommended router in this library.
 
-moe_routing.py's kernel selects top-K via K sequential "find max, mask it,
-repeat" passes. That has a serial critical path of depth O(K) — fine for
-K=2, but by K=8 with many experts it starts losing to PyTorch's topk,
-which uses a more parallel selection algorithm.
-
-This version replaces the sequential scan with ONE sort, using Triton's
-`tl.sort`, which is itself implemented as a bitonic sorting network under
-the hood — the same recursive butterfly/divide-and-conquer structure as
-an FFT (compare-and-swap stages instead of butterfly adds). A bitonic sort
-of E elements has depth O(log^2 E), independent of K, so this should scale
-much better as K grows.
-
-The catch: tl.sort only sorts a vector of values, it doesn't carry a
-companion index array. So we pack (quantized_key, original_index) into a
-single sortable int32 key before sorting, then unpack after.
-
-v1 -> v2 fix #1: the first version quantized the *softmax probability*.
-That breaks down at large expert counts: probabilities get compressed into
-a tiny range (~1/E on average), so many experts near the top-K boundary
-can differ by less than the quantization step, causing occasional wrong
-selections at the cutoff (confirmed by testing: correct at E=64, wrong at
-E=128,k=16). Fix: quantize the *logit* instead (via a bounded, strictly
-monotonic tanh transform), since softmax is monotonic in the logit and
-logits aren't compressed into [0, 1/E] the way probabilities are.
-
-v2 fix #2: after fixing correctness, benchmarking revealed forward time
-still scaled ~linearly with K, almost as steeply as the original
-sequential kernel. Root cause: extracting the top-K elements out of the
-sorted array was *itself* still a `for kk in range(K)` Python loop — the
-sort became K-independent, but the readout after it wasn't. Fixed by
-extracting all K elements in one vectorized 2D operation: build a
-(BLOCK_K x BLOCK_SIZE) comparison tile and reduce once, instead of K
-separate sequential reductions.
-
-STATUS: this is a new, less battle-tested kernel than the rest of the
-library. Run tests/test_moe_routing_v2.py and report any errors.
-
-Usage:
-    from fusedkernels.moe_routing_v2 import fused_moe_route_v2
-    topk_weights, topk_idx = fused_moe_route_v2(router_logits, k=8)
+Design history (see README for the full narrative):
+- v1 (moe_routing.py) selects top-K via K sequential "find max, mask,
+  repeat" passes — O(K) serial critical path, degrades badly at high K
+  (measured down to 0.18x vs native PyTorch at K=32).
+- v2 replaces the sequential scan with ONE tl.sort call (depth
+  O(log^2 E), independent of K), then extracts the top-K in one
+  vectorized 2D-tile operation instead of a second K-dependent loop.
+- Precision fix: ranks by a bounded, monotonic tanh transform of the
+  LOGIT (not the softmax probability) before quantizing to an integer
+  sort key. Ranking by probability directly breaks down at large expert
+  counts because probabilities compress into a tiny range (~1/E on
+  average), so quantization error can flip the ranking of near-tied
+  experts. Logits aren't compressed this way, so precision holds.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-# quantization scale for packing the (tanh-squashed) logit into the sort
-# key. tanh output is in (-1, 1); SCALE * BLOCK_SIZE must stay well under
-# int32 range (~2.1e9).
 _SCALE = 1 << 22
-# temperature for the tanh squashing — larger T means less saturation for
-# large-magnitude logits, at the cost of slightly less resolution near 0.
-# 10.0 comfortably covers typical router logit magnitudes without
-# saturating in the region that matters for top-k ranking.
 _TANH_TEMP = 10.0
 
 
@@ -81,35 +49,31 @@ def _moe_route_fwd_kernel_v2(
     p = tl.exp(logits - m)
     p = tl.where(mask, p, 0.0)
     s = tl.sum(p, axis=0)
-    probs = p / s  # padding slots -> 0 (since their logits were -inf)
+    probs = p / s
 
-    # rank by a bounded, strictly-monotonic transform of the LOGIT (not the
-    # probability) — avoids the probability-compression precision problem
-    # at large expert counts, since softmax(x) is monotonic in x.
-    safe_logits = tl.where(mask, logits, -1e30)  # keep padding maximally negative pre-tanh
-    t = (2.0 / (1.0 + tl.exp(-2.0 * safe_logits / TANH_TEMP))) - 1.0  # tanh(x/T) via sigmoid identity
-    quant = ((t + 1.0) * 0.5 * SCALE).to(tl.int32)  # in [0, SCALE]
-    key = tl.where(mask, quant * BLOCK_SIZE + cols, -1)  # padding sorts last
+    # rank by a bounded, monotonic transform of the LOGIT — see module
+    # docstring for why this avoids the probability-compression problem
+    safe_logits = tl.where(mask, logits, -1e30)
+    t = (2.0 / (1.0 + tl.exp(-2.0 * safe_logits / TANH_TEMP))) - 1.0
+    quant = ((t + 1.0) * 0.5 * SCALE).to(tl.int32)
+    key = tl.where(mask, quant * BLOCK_SIZE + cols, -1)
 
-    # ONE sort call — internally a bitonic network, depth O(log^2 BLOCK_SIZE),
-    # independent of K. This replaces the K sequential comparison passes.
+    # ONE sort call — internally a bitonic network, depth O(log^2 E),
+    # independent of K
     sorted_key = tl.sort(key, descending=True)
 
-    # --- vectorized extraction of all K top elements at once ---
-    # build a (BLOCK_K x BLOCK_SIZE) tile: row kk picks out position kk of
-    # sorted_key via a one-hot mask, all K rows computed in parallel instead
-    # of a sequential kk=0..K-1 loop.
+    # vectorized extraction of all K top elements at once — a
+    # (BLOCK_K x BLOCK_SIZE) one-hot tile, reduced in one shot, instead
+    # of a K-iteration Python loop
     k_range = tl.arange(0, BLOCK_K)
     kmask = k_range < K
-    pos_grid = k_range[:, None] == cols[None, :]           # (BLOCK_K, BLOCK_SIZE)
-    picked = tl.sum(tl.where(pos_grid, sorted_key[None, :], 0), axis=1)  # (BLOCK_K,)
-    idx = picked % BLOCK_SIZE                               # (BLOCK_K,)
+    pos_grid = k_range[:, None] == cols[None, :]
+    picked = tl.sum(tl.where(pos_grid, sorted_key[None, :], 0), axis=1)
+    idx = picked % BLOCK_SIZE
 
-    # vectorized gather of the exact original probability for each picked
-    # index (not a decoded/quantized approximation) — same one-hot-grid
-    # trick, this time gathering from `probs` instead of `sorted_key`.
-    gather_grid = idx[:, None] == cols[None, :]              # (BLOCK_K, BLOCK_SIZE)
-    val = tl.sum(tl.where(gather_grid, probs[None, :], 0.0), axis=1)  # (BLOCK_K,)
+    # gather the EXACT original probability (not a quantized approximation)
+    gather_grid = idx[:, None] == cols[None, :]
+    val = tl.sum(tl.where(gather_grid, probs[None, :], 0.0), axis=1)
 
     sum_topk = tl.sum(tl.where(kmask, val, 0.0), axis=0)
     val_normalized = val / sum_topk
@@ -127,8 +91,10 @@ def _moe_route_bwd_kernel_v2(
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    # identical backward math to v1 — subset-softmax Jacobian, unaffected by
-    # how the forward selected the top-K, only by which K were selected.
+    # subset-softmax Jacobian: the discrete routing DECISION (which
+    # experts were picked) is treated as non-differentiable (standard
+    # convention, matches Switch Transformer / GShard); only the
+    # continuous combine weights carry gradient.
     row = tl.program_id(0)
     k_range = tl.arange(0, BLOCK_K)
     kmask = k_range < K
@@ -197,9 +163,11 @@ class _FusedMoERouteV2(torch.autograd.Function):
 
 
 def fused_moe_route_v2(router_logits: torch.Tensor, k: int):
-    """Experimental bitonic-sort-based version of fused_moe_route.
-    Same interface and semantics as fused_moe_route (see moe_routing.py),
-    but selects top-K via a single sort instead of K sequential passes —
-    intended to scale better as K grows.
+    """Fused MoE router: fuses softmax + top-k selection + renormalization
+    into one Triton kernel launch, using tl.sort for selection. Drop-in
+    replacement for:
+        probs = F.softmax(router_logits, dim=-1)
+        topk_weights, topk_idx = torch.topk(probs, k, dim=-1)
+        topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
     """
     return _FusedMoERouteV2.apply(router_logits, k)

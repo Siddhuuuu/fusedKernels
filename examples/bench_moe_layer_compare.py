@@ -1,7 +1,7 @@
 """
-Full MoE MLP layer comparison: naive routing vs v1 (sequential) vs v2
-(bitonic sort + vectorized extraction) router, at realistic large-expert
-shapes where the router-level gains actually showed up.
+Full MoE MLP layer comparison: naive dispatch vs v1/v2-routed masked
+dispatch vs sorted dispatch. This is what revealed that dispatch overhead
+(not the router) was the real bottleneck at higher expert counts.
 
 Run:
     python examples/bench_moe_layer_compare.py
@@ -13,7 +13,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fusedkernels.moe_layer import FusedMoEMLP, Expert
-from fusedkernels.moe_layer_sorted import FusedMoEMLPSorted
 from fusedkernels.moe_layer_sorted import FusedMoEMLPSorted
 
 
@@ -62,30 +61,25 @@ def bench_layer(layer, x, warmup=20, iters=100):
         y.sum().backward()
         layer.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
-    elapsed = (time.perf_counter() - start) / iters
-    return elapsed * 1000
+    return (time.perf_counter() - start) / iters * 1000
 
 
 def run_config(B, T, D, H, n_experts, k):
     x = torch.randn(B, T, D, device="cuda", dtype=torch.bfloat16)
 
     naive = NaiveMoEMLP(D, H, n_experts, k).cuda().to(torch.bfloat16)
-    v1 = FusedMoEMLP(D, H, n_experts, k, router_version="v1").cuda().to(torch.bfloat16)
-    v2 = FusedMoEMLP(D, H, n_experts, k, router_version="v2").cuda().to(torch.bfloat16)
+    v2_masked = FusedMoEMLP(D, H, n_experts, k, router_version="v2").cuda().to(torch.bfloat16)
     v2_sorted = FusedMoEMLPSorted(D, H, n_experts, k, router_version="v2").cuda().to(torch.bfloat16)
-    v1.load_state_dict(naive.state_dict())
-    v2.load_state_dict(naive.state_dict())
+    v2_masked.load_state_dict(naive.state_dict())
     v2_sorted.load_state_dict(naive.state_dict())
 
     t_naive = bench_layer(naive, x)
-    t_v1 = bench_layer(v1, x)
-    t_v2 = bench_layer(v2, x)
-    t_v2_sorted = bench_layer(v2_sorted, x)
+    t_masked = bench_layer(v2_masked, x)
+    t_sorted = bench_layer(v2_sorted, x)
 
     print(f"experts={n_experts:>4} k={k:>3}  "
-          f"naive={t_naive:8.3f}ms  v1_masked={t_v1:8.3f}ms  v2_masked={t_v2:8.3f}ms  "
-          f"v2_sorted={t_v2_sorted:8.3f}ms  "
-          f"v2masked_speedup={t_naive/t_v2:5.2f}x  v2sorted_speedup={t_naive/t_v2_sorted:5.2f}x")
+          f"naive={t_naive:8.3f}ms  v2_masked={t_masked:8.3f}ms  v2_sorted={t_sorted:8.3f}ms  "
+          f"masked_spd={t_naive/t_masked:5.2f}x  sorted_spd={t_naive/t_sorted:5.2f}x")
 
 
 def main():

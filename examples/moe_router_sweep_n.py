@@ -1,8 +1,6 @@
 """
-3D sweep: does the fusion crossover point shift with N (number of tokens)?
-Small N (e.g. inference-time single batch) vs large N (e.g. big pretraining
-batch) may behave differently — small N means kernel launch overhead
-dominates more; large N means the actual per-token work dominates more.
+Does the fusion crossover point shift with N (number of tokens)? Small N
+(inference-time) vs large N (pretraining batch) may behave differently.
 
 Run:
     python examples/moe_router_sweep_n.py
@@ -51,7 +49,7 @@ def main():
     assert torch.cuda.is_available()
 
     n_values = [512, 2048, 8192, 32768, 131072]
-    ek_configs = [(64, 8), (64, 32), (128, 32)]  # a small/medium/large-stress mix
+    ek_configs = [(64, 8), (64, 32), (128, 32)]
 
     rows = []
     print(f"{'N':>10}{'n_experts':>10}{'k':>5}{'native (ms)':>13}{'v2 (ms)':>11}{'v2 speedup':>12}")

@@ -1,11 +1,4 @@
-"""
-Correctness tests for the experimental bitonic-sort router (v2).
-Same checks as test_moe_correctness.py, run against v2 instead of v1.
-
-NOTE: this kernel is new and untested on real hardware as of writing.
-If any of these fail, the error output is exactly what's needed to debug
-the tl.sort usage / key-packing logic — paste it back for a fix.
-"""
+"""Correctness tests for v2 router (tl.sort based, main recommended router)."""
 
 import pytest
 import torch
@@ -36,7 +29,7 @@ def test_fused_moe_route_v2_matches_naive(n_experts, k):
 
     ref_sets = [set(row.tolist()) for row in idx_ref]
     fused_sets = [set(row.tolist()) for row in idx_fused]
-    assert ref_sets == fused_sets, "v2: selected expert sets differ from naive routing"
+    assert ref_sets == fused_sets, f"selected expert sets differ at n_experts={n_experts}, k={k}"
 
     def sorted_weights(idx, w):
         order = idx.argsort(dim=-1)
@@ -44,8 +37,7 @@ def test_fused_moe_route_v2_matches_naive(n_experts, k):
 
     w_ref_sorted = sorted_weights(idx_ref, w_ref)
     w_fused_sorted = sorted_weights(idx_fused, w_fused)
-    assert torch.allclose(w_ref_sorted, w_fused_sorted, atol=1e-3, rtol=1e-3), \
-        "v2: combine weights differ from naive routing"
+    assert torch.allclose(w_ref_sorted, w_fused_sorted, atol=1e-3, rtol=1e-3)
 
     grad_sorted = torch.randn_like(w_ref_sorted)
 
@@ -60,8 +52,7 @@ def test_fused_moe_route_v2_matches_naive(n_experts, k):
     w_ref.backward(grad_ref)
     w_fused.backward(grad_fused)
 
-    assert torch.allclose(logits_ref.grad, logits_fused.grad, atol=1e-3, rtol=1e-3), \
-        "v2: router logits gradient mismatch vs naive routing"
+    assert torch.allclose(logits_ref.grad, logits_fused.grad, atol=1e-3, rtol=1e-3)
 
 
 def test_fused_moe_route_v2_weights_sum_to_one():
@@ -71,14 +62,11 @@ def test_fused_moe_route_v2_weights_sum_to_one():
     logits = torch.randn(512, 32, device="cuda")
     w, _ = fused_moe_route_v2(logits, k=4)
     sums = w.sum(dim=-1)
-    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-4), \
-        "v2: top-k combine weights should sum to 1 per token"
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-4)
 
 
 @pytest.mark.parametrize("n_experts,k", [(64, 8), (128, 16)])
 def test_v2_matches_v1(n_experts, k):
-    """Sanity cross-check: v1 (sequential) and v2 (sorted) should select the
-    same experts and weights on the same input, despite different algorithms."""
     from fusedkernels.moe_routing import fused_moe_route
     from fusedkernels.moe_routing_v2 import fused_moe_route_v2
 

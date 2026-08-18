@@ -1,24 +1,14 @@
 """
-A usable MoE MLP block built around the fused router.
+A usable MoE MLP block built around the fused router (BASELINE dispatch
+version — kept as the naive comparison point; see moe_layer_sorted.py for
+the optimized version).
 
-Honest scope note: this fuses the *router* (softmax + top-k + renormalize)
-into one kernel. The expert computation itself uses straightforward masked
-matmuls (loop over experts, mask tokens not routed to that expert) rather
-than a fully fused token-dispatch/permute/combine kernel. Building a fused
-dispatch kernel (physically gathering each expert's tokens into a
-contiguous buffer, computing, then scattering results back) is a
-meaningfully bigger project — that's what makes libraries like Megablocks
-non-trivial — and is the natural "next step" if you want to push further.
-
-This layer is still a real, usable, drop-in MoE MLP for a transformer
-block, and the fused router alone is fusing three separate kernel
-launches (softmax, topk, renormalize) into one for every token at every
-MoE layer, which is a real, currently-common bottleneck.
-
-Usage:
-    from fusedkernels.moe_layer import FusedMoEMLP
-    moe = FusedMoEMLP(dim=1024, hidden_dim=2048, n_experts=8, k=2).cuda()
-    out = moe(x)   # x: [B, T, dim]
+Scope note: this fuses the *router* but uses straightforward masked
+matmuls for expert dispatch (loop over experts, boolean-mask tokens not
+routed to that expert). Benchmarking showed this masked-loop dispatch —
+not the router — becomes the dominant bottleneck at higher expert counts
+(boolean masking + advanced indexing overhead scales with expert count).
+moe_layer_sorted.py fixes this with sorted/contiguous dispatch instead.
 """
 
 import torch
@@ -30,7 +20,7 @@ from .moe_routing_v2 import fused_moe_route_v2
 
 
 class Expert(nn.Module):
-    """A single expert MLP (SwiGLU-style, matches typical MoE experts)."""
+    """A single expert MLP (SwiGLU-style)."""
     def __init__(self, dim, hidden_dim):
         super().__init__()
         self.w_gate = nn.Linear(dim, hidden_dim, bias=False)
@@ -54,23 +44,21 @@ class FusedMoEMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
-        x_flat = x.reshape(-1, self.dim)  # [N, dim]
+        x_flat = x.reshape(-1, self.dim)
         N = x_flat.shape[0]
 
-        router_logits = self.router(x_flat)  # [N, n_experts]
+        router_logits = self.router(x_flat)
         route_fn = fused_moe_route_v2 if self.router_version == "v2" else fused_moe_route
-        topk_weights, topk_idx = route_fn(router_logits, self.k)  # [N, K] each
+        topk_weights, topk_idx = route_fn(router_logits, self.k)
 
         out = torch.zeros_like(x_flat)
         for expert_id, expert in enumerate(self.experts):
-            # find (token, slot) pairs routed to this expert
-            match = topk_idx == expert_id            # [N, K] bool
-            token_mask = match.any(dim=-1)            # [N] bool: does this token use this expert
+            match = topk_idx == expert_id
+            token_mask = match.any(dim=-1)
             if not token_mask.any():
                 continue
-            weight_for_expert = (topk_weights * match).sum(dim=-1)  # [N] combine weight (0 if not routed here)
-
-            expert_out = expert(x_flat[token_mask])                 # [n_selected, dim]
+            weight_for_expert = (topk_weights * match).sum(dim=-1)
+            expert_out = expert(x_flat[token_mask])
             out[token_mask] += expert_out * weight_for_expert[token_mask].unsqueeze(-1)
 
         return out.reshape(orig_shape)
